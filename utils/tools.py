@@ -119,7 +119,7 @@ def load_model_weight(load_path, model, device, args):
             best_acc1 = checkpoint['best_acc1']
         except:
             best_acc1 = torch.tensor(0)
-        if device is not 'cpu':
+        if device != 'cpu':
             # best_acc1 may be from a checkpoint from a different GPU
             best_acc1 = best_acc1.to(device)
         try:

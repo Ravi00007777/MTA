@@ -45,13 +45,14 @@ def solve_mta(model, inputs, args):
     mode = mode / mode.norm(p=2, dim=-1, keepdim=False).clamp_min(1e-6)
 
     for _ in range(max_iter):
-        old_mode = mode
-        old_y = y
+        old_mode = mode.clone()
+        old_y = y.clone()
 
         # Eq. 6: inlierness update (softmax keeps y on probability simplex).
         density = gaussian_kernel(mode, bandwidth, image_features)
-        weighted_affinity = affinity_matrix * y.unsqueeze(0)
-        y = F.softmax((density + lambda_q * torch.sum(weighted_affinity, dim=1)) / lambda_y, dim=-1)
+        affinity_term = affinity_matrix @ y
+        logits_y = (density + lambda_q * affinity_term) / lambda_y
+        y = F.softmax(logits_y, dim=-1)
 
         # Eq. 8: kernel MeanShift mode update with soft inlierness weights.
         density = gaussian_kernel(mode, bandwidth, image_features)
@@ -60,7 +61,9 @@ def solve_mta(model, inputs, args):
         mode = torch.sum(weighted_density.unsqueeze(1) * image_features, dim=0) / denom
         mode = mode / mode.norm(p=2, dim=-1, keepdim=False).clamp_min(1e-6)
 
-        if torch.norm(old_mode - mode, p=2) < tol and torch.norm(old_y - y, p=2) < tol:
+        delta_mode = torch.norm(old_mode - mode, p=2)
+        delta_y = torch.norm(old_y - y, p=2)
+        if delta_mode < tol and delta_y < tol:
             break
 
     output = mode.unsqueeze(0) @ text_features.t() * logit_scale

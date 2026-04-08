@@ -1,9 +1,31 @@
 import argparse
+import os
+import importlib.util
 
 import time
 from contextlib import nullcontext
 
 from copy import deepcopy
+
+def _check_runtime_dependencies():
+    required = {
+        "numpy": "numpy",
+        "torch": "torch",
+        "torchvision": "torchvision",
+        "PIL": "pillow",
+        "tqdm": "tqdm",
+        "open_clip": "open_clip_torch",
+    }
+    missing = [pip_name for module_name, pip_name in required.items() if importlib.util.find_spec(module_name) is None]
+    if missing:
+        cmd = "python3 -m pip install " + " ".join(sorted(set(missing)))
+        raise SystemExit(
+            "Missing required dependencies: {}\n"
+            "Install them with:\n  {}".format(", ".join(sorted(set(missing))), cmd)
+        )
+
+
+_check_runtime_dependencies()
 
 from PIL import Image
 import numpy as np
@@ -15,6 +37,7 @@ import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
+import torchvision.datasets as datasets
 
 
 try:
@@ -38,6 +61,52 @@ from mta import solve_mta
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
+
+
+def detect_colab_environment():
+    if "COLAB_GPU" in os.environ:
+        return True
+    try:
+        import google.colab  # type: ignore
+        return True
+    except Exception:
+        return False
+
+
+def download_cifar10_for_colab(data_root):
+    cifar_root = os.path.join(data_root, "cifar10")
+    os.makedirs(cifar_root, exist_ok=True)
+    print(f"[colab] Downloading CIFAR10 to {cifar_root} ...")
+    datasets.CIFAR10(root=cifar_root, train=True, download=True)
+    datasets.CIFAR10(root=cifar_root, train=False, download=True)
+    print("[colab] CIFAR10 download complete. This is for quick environment validation.")
+
+
+def resolve_data_root(data_root):
+    placeholder_tokens = [
+        "/path/to/data",
+        "/absolute/path/to/your/datasets",
+        "/REAL/PATH/TO/DATASET_ROOT",
+        "/your/real/path",
+    ]
+    if any(token in data_root for token in placeholder_tokens):
+        raise SystemExit(
+            "Please provide real dataset path.\n"
+            "Examples:\n"
+            "  --data /path/to/ImageNet\n"
+            "  --data /data/ImageNet\n"
+            "  --data /content/datasets/ImageNet"
+        )
+    return data_root
+
+
+def _list_dirs_for_hint(path):
+    if not path or not os.path.isdir(path):
+        return []
+    try:
+        return sorted([d.name for d in os.scandir(path) if d.is_dir()])[:20]
+    except OSError:
+        return []
 
 
 def select_confident_samples(logits, top):
@@ -94,20 +163,69 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
     return
 
 
-def main():
-    args = parser.parse_args()
-    set_random_seed(args.seed)
+def main(args=None):
+    if args is None:
+        args = parser.parse_args()
+    if not args.data:
+        print("[data][warning] --data not provided. Running in default test mode with synthetic data.")
+        args.use_fallback_dataset = True
+        args.data = "/tmp/mta_dummy_data"
+    args.data = resolve_data_root(args.data)
+    if not os.path.isdir(args.data):
+        parent = os.path.dirname(args.data) if args.data else ""
+        visible = _list_dirs_for_hint(parent)
+        if not args.use_fallback_dataset:
+            raise SystemExit(
+                "Invalid --data path: {}\n"
+                "Available directories under '{}': {}\n"
+                "Suggestion: provide a real dataset root with ImageNet/val or val/test folders.".format(
+                    args.data,
+                    parent if parent else "(unknown)",
+                    ", ".join(visible) if visible else "(none found)"
+                )
+            )
+        print(f"[data][warning] Provided path does not exist: {args.data}")
+        print("[data][warning] Using fallback synthetic dataset mode.")
 
-    if not torch.cuda.is_available():
-        args.gpu = None
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("[device][warning] CUDA requested but not available. Falling back to CPU.")
+        args.device = "cpu"
+
+    if detect_colab_environment():
+        print("[colab] Google Colab environment detected.")
+        print("[colab] Install deps: !pip install ftfy regex tqdm scipy")
+        if args.colab_download_cifar:
+            download_cifar10_for_colab(args.data)
+
+    set_random_seed(args.seed)
     main_worker(args.gpu, args)
 
 
 def main_worker(gpu, args):
     args.gpu = gpu
     set_random_seed(args.seed)
-    device = torch.device(f"cuda:{args.gpu}" if args.gpu is not None and torch.cuda.is_available() else "cpu")
-    print("Use device: {}".format(device))
+    if args.device == "cuda":
+        if args.gpu is None:
+            args.gpu = 0
+        device = torch.device(f"cuda:{args.gpu}")
+    else:
+        args.gpu = None
+        device = torch.device("cpu")
+    print("Using device: {}".format(device))
+
+    if args.mta:
+        if args.arch not in {"ViT-B/16", "ViT-L/14"}:
+            raise ValueError(
+                "MTA requires a CLIP ViT backbone (ViT-B/16 minimum, ViT-L/14 preferred). "
+                f"Received: {args.arch}"
+            )
+        if args.mta_tau <= 0:
+            raise ValueError("mta_tau must be > 0 for temperature-scaled text affinity.")
+        if not (64 <= args.mta_views <= 128):
+            print(
+                "Warning: mta_views is outside the paper-aligned range [64, 128]. "
+                f"Current value: {args.mta_views}"
+            )
 
     # create model (zero-shot clip model (ViT-L/14@px336) with promptruning)
     if args.test_sets in fewshot_datasets:
@@ -222,7 +340,13 @@ def main_worker(gpu, args):
         else:
             model.reset_classnames(classnames, args.arch)
 
-        val_dataset = build_dataset(set_id, data_transform, args.data, mode=args.dataset_mode)
+        val_dataset = build_dataset(
+            set_id,
+            data_transform,
+            args.data,
+            mode=args.dataset_mode,
+            allow_fallback=args.use_fallback_dataset
+        )
         print("number of test samples: {}".format(len(val_dataset)))
         val_loader = torch.utils.data.DataLoader(
                     val_dataset,
@@ -370,6 +494,8 @@ if __name__ == '__main__':
                         metavar='N', help='print frequency (default: 10)')
     parser.add_argument('--gpu', default=None, type=int,
                         help='GPU id to use.')
+    parser.add_argument('--device', type=str, default=("cuda" if torch.cuda.is_available() else "cpu"),
+                        choices=["cuda", "cpu"], help='execution device')
     parser.add_argument('--tpt', action='store_true', default=False, help='run test-time prompt tuning')
     parser.add_argument('--selection_p', default=0.1, type=float, help='confidence selection percentile')
     parser.add_argument('--tta_steps', default=1, type=int, help='test-time-adapt steps')
@@ -383,11 +509,18 @@ if __name__ == '__main__':
     parser.add_argument('--mta', action='store_true', default=False, help='run meanshift test-time adaptation (MTA)')
     parser.add_argument('--lambda_q', default=4.0, type=float, help='quadratic term weighting factor')
     parser.add_argument('--lambda_y', default=0.2, type=float, help='entropic term weighting factor')
-    parser.add_argument('--mta_tau', default=1.0, type=float, help='temperature for text-affinity in MTA')
+    parser.add_argument('--mta_tau', default=1.0, type=float, help='temperature for text-affinity in MTA (must be > 0)')
     parser.add_argument('--mta_max_iter', default=20, type=int, help='max alternating iterations for MTA')
     parser.add_argument('--mta_tol', default=1e-6, type=float, help='convergence threshold for MTA')
     parser.add_argument('--mta_bandwidth_frac', default=0.3, type=float, help='fraction of neighbors for adaptive bandwidth')
     parser.add_argument('--mta_views', default=127, type=int, help='number of augmented views for MTA')
     parser.add_argument('--eval_mta_variants', action='store_true', default=False, help='report baseline and mean-pooling vs MTA')
+    parser.add_argument('--use_fallback_dataset', action='store_true', help='fallback to FakeData if dataset path is invalid')
+    parser.add_argument('--no_fallback_dataset', action='store_true', help='disable fallback dataset behavior')
+    parser.add_argument('--colab_download_cifar', action='store_true', help='download CIFAR10 in Colab for quick setup validation')
+    parser.set_defaults(use_fallback_dataset=False)
     
-    main()
+    cli_args = parser.parse_args()
+    if cli_args.no_fallback_dataset:
+        cli_args.use_fallback_dataset = False
+    main(cli_args)

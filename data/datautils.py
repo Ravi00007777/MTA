@@ -35,14 +35,104 @@ ID_to_DIRNAME={
     'eurosat': 'eurosat'
 }
 
-def build_dataset(set_id, transform, data_root, mode='test', n_shot=None, split="all", bongard_anno=False):
+
+def _list_subdirs(path):
+    if not path or not os.path.isdir(path):
+        return []
+    try:
+        return sorted([entry.name for entry in os.scandir(path) if entry.is_dir()])[:30]
+    except OSError:
+        return []
+
+
+def _resolve_existing_dir(candidates, set_id, data_root):
+    print(f"[data] set={set_id} | data_root={data_root}")
+    print("[data] checking candidate directories:")
+    for path in candidates:
+        print(f"[data]   - {path}")
+    for path in candidates:
+        if os.path.isdir(path):
+            print(f"[data] resolved dataset directory: {path}")
+            return path
+    available = _list_subdirs(data_root)
+    available_str = ", ".join(available) if available else "(none / path does not exist)"
+    pretty = "\n".join([f"  - {p}" for p in candidates])
+    raise FileNotFoundError(
+        f"Could not locate dataset directory for set '{set_id}'.\n"
+        f"Given --data root: {data_root}\n"
+        f"Tried:\n{pretty}\n"
+        f"Available subdirectories under data_root: {available_str}\n"
+        "Expected one of these structures:\n"
+        "  1) <data_root>/ImageNet/val/<class_folders>\n"
+        "  2) <data_root>/val/<class_folders>\n"
+        "  3) <data_root>/test/<class_folders>\n"
+        "Please pass --data to your real dataset root."
+    )
+
+
+def _looks_like_imagefolder(path):
+    if not os.path.isdir(path):
+        return False
+    try:
+        return any(entry.is_dir() for entry in os.scandir(path))
+    except OSError:
+        return False
+
+
+def _make_fallback_dataset(transform, set_id):
+    # Class counts chosen to stay compatible with expected CLIP classifier outputs.
+    fallback_num_classes = {
+        'I': 1000,
+        'K': 1000,
+        'V': 1000,
+        'A': 200,
+        'R': 200,
+    }.get(set_id, 1000)
+    print(
+        f"[data][fallback] Using torchvision FakeData for set={set_id} "
+        f"(size=64, num_classes={fallback_num_classes})."
+    )
+    return datasets.FakeData(
+        size=64,
+        image_size=(3, 224, 224),
+        num_classes=fallback_num_classes,
+        transform=transform,
+    )
+
+def build_dataset(set_id, transform, data_root, mode='test', n_shot=None, split="all", bongard_anno=False, allow_fallback=False):
     if set_id == 'I':
         # ImageNet validation set
-        testdir = os.path.join(os.path.join(data_root, ID_to_DIRNAME[set_id]), 'val')
-        testset = datasets.ImageFolder(testdir, transform=transform)
+        candidates = [
+            os.path.join(data_root, ID_to_DIRNAME[set_id], "val"),  # data_root/ImageNet/val
+            os.path.join(data_root, "val"),                         # data_root/val
+            os.path.join(data_root, "test"),                        # data_root/test
+            data_root,                                              # data_root is already val directory
+        ]
+        try:
+            testdir = _resolve_existing_dir(candidates, set_id=set_id, data_root=data_root)
+            if testdir == data_root and not _looks_like_imagefolder(testdir):
+                testdir = _resolve_existing_dir(candidates[:3], set_id=set_id, data_root=data_root)
+            testset = datasets.ImageFolder(testdir, transform=transform)
+        except FileNotFoundError:
+            if not allow_fallback:
+                raise
+            testset = _make_fallback_dataset(transform, set_id)
     elif set_id in ['A', 'K', 'R', 'V']:
-        testdir = os.path.join(data_root, ID_to_DIRNAME[set_id], 'images')
-        testset = datasets.ImageFolder(testdir, transform=transform)
+        candidates = [
+            os.path.join(data_root, ID_to_DIRNAME[set_id], "images"),  # data_root/<dataset>/images
+            os.path.join(data_root, "images"),                         # data_root/images
+            os.path.join(data_root, "test"),                           # data_root/test
+            data_root,                                                 # data_root is already images directory
+        ]
+        try:
+            testdir = _resolve_existing_dir(candidates, set_id=set_id, data_root=data_root)
+            if testdir == data_root and not _looks_like_imagefolder(testdir):
+                testdir = _resolve_existing_dir(candidates[:3], set_id=set_id, data_root=data_root)
+            testset = datasets.ImageFolder(testdir, transform=transform)
+        except FileNotFoundError:
+            if not allow_fallback:
+                raise
+            testset = _make_fallback_dataset(transform, set_id)
     elif set_id in fewshot_datasets:
         if mode == 'train' and n_shot:
             testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode, n_shot=n_shot)
