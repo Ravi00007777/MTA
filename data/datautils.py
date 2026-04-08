@@ -86,10 +86,17 @@ def augmix(image, preprocess, aug_list, severity=1):
 
 class AugMixAugmenter(object):
     def __init__(self, base_transform, preprocess, n_views=2, augmix=False, 
-                    severity=1):
+                    severity=1, use_mta_ops=False):
         self.base_transform = base_transform
         self.preprocess = preprocess
         self.n_views = n_views
+        self.use_mta_ops = use_mta_ops
+        self.mta_ops = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(0.5, 1.0), interpolation=BICUBIC),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+        ])
         if augmix:
             self.aug_list = augmentations.augmentations
         else:
@@ -98,7 +105,10 @@ class AugMixAugmenter(object):
         
     def __call__(self, x):
         image = self.preprocess(self.base_transform(x))
-        views = [augmix(x, self.preprocess, self.aug_list, self.severity) for _ in range(self.n_views)]
+        if self.use_mta_ops:
+            views = [self.preprocess(self.mta_ops(x)) for _ in range(self.n_views)]
+        else:
+            views = [augmix(x, self.preprocess, self.aug_list, self.severity) for _ in range(self.n_views)]
         return [image] + views
 
 

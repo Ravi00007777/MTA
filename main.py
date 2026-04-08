@@ -1,6 +1,7 @@
 import argparse
 
 import time
+from contextlib import nullcontext
 
 from copy import deepcopy
 
@@ -51,6 +52,13 @@ def avg_entropy(outputs):
     avg_logits = torch.clamp(avg_logits, min=min_real)
     return -(avg_logits * torch.exp(avg_logits)).sum(dim=-1)
 
+def mean_pool_logits(model, images):
+    amp_ctx = torch.cuda.amp.autocast if torch.cuda.is_available() else nullcontext
+    with torch.no_grad():
+        with amp_ctx():
+            logits = model(images)
+    return logits.mean(dim=0, keepdim=True)
+
 
 def test_time_tuning(model, inputs, optimizer, scaler, args):
     if args.cocoop:
@@ -59,8 +67,9 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
         optimizer = torch.optim.AdamW([pgen_ctx], args.lr)
     
     selected_idx = None
+    amp_ctx = torch.cuda.amp.autocast if torch.cuda.is_available() else nullcontext
     for j in range(args.tta_steps):
-        with torch.cuda.amp.autocast():
+        with amp_ctx():
             if args.cocoop:
                 output = model((image_feature, pgen_ctx))
             else:
@@ -89,15 +98,16 @@ def main():
     args = parser.parse_args()
     set_random_seed(args.seed)
 
-    # This codebase has only been tested under the single GPU setting
-    assert args.gpu is not None
+    if not torch.cuda.is_available():
+        args.gpu = None
     main_worker(args.gpu, args)
 
 
 def main_worker(gpu, args):
     args.gpu = gpu
     set_random_seed(args.seed)
-    print("Use GPU: {} for training".format(args.gpu))
+    device = torch.device(f"cuda:{args.gpu}" if args.gpu is not None and torch.cuda.is_available() else "cpu")
+    print("Use device: {}".format(device))
 
     # create model (zero-shot clip model (ViT-L/14@px336) with promptruning)
     if args.test_sets in fewshot_datasets:
@@ -110,7 +120,7 @@ def main_worker(gpu, args):
         load_model_weight(args.load, model, 'cpu', args) # to load to cuda: device="cuda:{}".format(args.gpu)
         model_state = deepcopy(model.state_dict())
     else:
-        model = get_coop(args.arch, args.test_sets, args.gpu, args.n_ctx, args.ctx_init)
+        model = get_coop(args.arch, args.test_sets, str(device), args.n_ctx, args.ctx_init)
         if args.load is not None:
             print("Use pre-trained soft prompt (CoOp) as initialization")
             pretrained_ctx = torch.load(args.load)['state_dict']['ctx']
@@ -130,12 +140,9 @@ def main_worker(gpu, args):
     
     print("=> Model created: visual backbone {}".format(args.arch))
     
-    if not torch.cuda.is_available():
-        print('using CPU, this will be slow')
-    else:
-        assert args.gpu is not None
+    if device.type == "cuda":
         torch.cuda.set_device(args.gpu)
-        model = model.cuda(args.gpu)
+    model = model.to(device)
 
     # define optimizer
     if args.cocoop or args.mta:
@@ -147,7 +154,7 @@ def main_worker(gpu, args):
         optim_state = deepcopy(optimizer.state_dict())
 
     # setup automatic mixed-precision (Amp) loss scaling
-    scaler = torch.cuda.amp.GradScaler(init_scale=1000)
+    scaler = torch.cuda.amp.GradScaler(init_scale=1000, enabled=(device.type == "cuda"))
 
     print('=> Using native Torch AMP. Training in mixed precision.')
 
@@ -169,8 +176,14 @@ def main_worker(gpu, args):
             preprocess = transforms.Compose([
                 transforms.ToTensor(),
                 normalize])
-            data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.batch_size-1, 
-                                            augmix=(len(set_id)>1 and args.tpt))
+            n_views = args.mta_views if args.mta else args.batch_size - 1
+            data_transform = AugMixAugmenter(
+                base_transform,
+                preprocess,
+                n_views=n_views,
+                augmix=(len(set_id)>1 and args.tpt),
+                use_mta_ops=args.mta
+            )
             batchsize = 1
         else:
             data_transform = transforms.Compose([
@@ -205,7 +218,7 @@ def main_worker(gpu, args):
             model.prompt_generator.reset_classnames(classnames, args.arch)
             model = model.cpu()
             model_state = model.state_dict()
-            model = model.cuda(args.gpu)
+            model = model.to(device)
         else:
             model.reset_classnames(classnames, args.arch)
 
@@ -214,7 +227,7 @@ def main_worker(gpu, args):
         val_loader = torch.utils.data.DataLoader(
                     val_dataset,
                     batch_size=batchsize, shuffle=True,
-                    num_workers=args.workers, pin_memory=True)
+                    num_workers=args.workers, pin_memory=(device.type == "cuda"))
             
         results[set_id] = test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state, scaler, args)
         del val_dataset, val_loader
@@ -236,9 +249,16 @@ def main_worker(gpu, args):
 
 
 def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state, scaler, args):
+    device = next(model.parameters()).device
+    amp_ctx = torch.cuda.amp.autocast if device.type == "cuda" else nullcontext
+
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
     top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
+    baseline_top1 = AverageMeter('Base@1', ':6.2f', Summary.AVERAGE)
+    baseline_top5 = AverageMeter('Base@5', ':6.2f', Summary.AVERAGE)
+    mean_top1 = AverageMeter('Mean@1', ':6.2f', Summary.AVERAGE)
+    mean_top5 = AverageMeter('Mean@5', ':6.2f', Summary.AVERAGE)
 
     progress = ProgressMeter(
         len(val_loader),
@@ -252,19 +272,18 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
             model.reset()
     end = time.time()
     for i, (images, target) in enumerate(val_loader):
-        assert args.gpu is not None
         if isinstance(images, list):
             for k in range(len(images)):
-                images[k] = images[k].cuda(args.gpu, non_blocking=True)
+                images[k] = images[k].to(device, non_blocking=(device.type == "cuda"))
             image = images[0]
         else:
             if len(images.size()) > 4:
                 # when using ImageNet Sampler as the dataset
                 assert images.size()[0] == 1
                 images = images.squeeze(0)
-            images = images.cuda(args.gpu, non_blocking=True)
+            images = images.to(device, non_blocking=(device.type == "cuda"))
             image = images
-        target = target.cuda(args.gpu, non_blocking=True)
+        target = target.to(device, non_blocking=(device.type == "cuda"))
         if args.tpt or args.mta:
             images = torch.cat(images, dim=0)
 
@@ -277,10 +296,21 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
                 optimizer.load_state_dict(optim_state)
                 test_time_tuning(model, images, optimizer, scaler, args)
             elif args.mta:
+                if args.eval_mta_variants:
+                    with torch.no_grad():
+                        with amp_ctx():
+                            base_output = model(image)
+                    mean_output = mean_pool_logits(model, images)
+                    b1, b5 = accuracy(base_output, target, topk=(1, 5))
+                    m1, m5 = accuracy(mean_output, target, topk=(1, 5))
+                    baseline_top1.update(b1[0], image.size(0))
+                    baseline_top5.update(b5[0], image.size(0))
+                    mean_top1.update(m1[0], image.size(0))
+                    mean_top5.update(m5[0], image.size(0))
                 output = solve_mta(model, images, args)
         else:
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
+                with amp_ctx():
                     image_feature, pgen_ctx = model.gen_ctx(images, args.tpt)
             optimizer = None
             pgen_ctx = test_time_tuning(model, (image_feature, pgen_ctx), optimizer, scaler, args)
@@ -292,7 +322,7 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
         
         if not args.mta:
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
+                with amp_ctx():
                     if args.cocoop:
                         output = model((image_feature, pgen_ctx))
                     else:
@@ -312,6 +342,14 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
             progress.display(i)
 
     progress.display_summary()
+    if args.mta and args.eval_mta_variants:
+        print(
+            "MTA variants @1: baseline {:.2f} | mean-pool {:.2f} | mta {:.2f} | +{:.2f} vs baseline | +{:.2f} vs mean".format(
+                baseline_top1.avg, mean_top1.avg, top1.avg,
+                top1.avg - baseline_top1.avg,
+                top1.avg - mean_top1.avg
+            )
+        )
 
     return [top1.avg, top5.avg]
 
@@ -321,7 +359,7 @@ if __name__ == '__main__':
     parser.add_argument('--data', type=str, help='path to dataset root')
     parser.add_argument('--test_sets', type=str, default='A/R/V/K/I', help='test dataset (multiple datasets split by slash)')
     parser.add_argument('--dataset_mode', type=str, default='test', help='which split to use: train/val/test')
-    parser.add_argument('-a', '--arch', metavar='ARCH', default='ViT-B/16')
+    parser.add_argument('-a', '--arch', metavar='ARCH', default='ViT-L/14')
     parser.add_argument('--resolution', default=224, type=int, help='CLIP image resolution')
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                         help='number of data loading workers (default: 4)')
@@ -330,7 +368,7 @@ if __name__ == '__main__':
                         metavar='LR', help='initial learning rate', dest='lr')
     parser.add_argument('-p', '--print-freq', default=200, type=int,
                         metavar='N', help='print frequency (default: 10)')
-    parser.add_argument('--gpu', default=0, type=int,
+    parser.add_argument('--gpu', default=None, type=int,
                         help='GPU id to use.')
     parser.add_argument('--tpt', action='store_true', default=False, help='run test-time prompt tuning')
     parser.add_argument('--selection_p', default=0.1, type=float, help='confidence selection percentile')
@@ -343,7 +381,13 @@ if __name__ == '__main__':
     
     # MTA arguments
     parser.add_argument('--mta', action='store_true', default=False, help='run meanshift test-time adaptation (MTA)')
-    parser.add_argument('--lambda_q', default=4, help='quadratic term weighting factor')
-    parser.add_argument('--lambda_y', default=0.2, help='entropic term weighting factor')
+    parser.add_argument('--lambda_q', default=4.0, type=float, help='quadratic term weighting factor')
+    parser.add_argument('--lambda_y', default=0.2, type=float, help='entropic term weighting factor')
+    parser.add_argument('--mta_tau', default=1.0, type=float, help='temperature for text-affinity in MTA')
+    parser.add_argument('--mta_max_iter', default=20, type=int, help='max alternating iterations for MTA')
+    parser.add_argument('--mta_tol', default=1e-6, type=float, help='convergence threshold for MTA')
+    parser.add_argument('--mta_bandwidth_frac', default=0.3, type=float, help='fraction of neighbors for adaptive bandwidth')
+    parser.add_argument('--mta_views', default=127, type=int, help='number of augmented views for MTA')
+    parser.add_argument('--eval_mta_variants', action='store_true', default=False, help='report baseline and mean-pooling vs MTA')
     
     main()
